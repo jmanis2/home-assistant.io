@@ -1,0 +1,146 @@
+# Den Haag festivals: scrape denhaag.com into a calendar and send a weekend digest.
+#
+# Needs, in configuration.yaml:
+#   homeassistant:
+#     packages: !include_dir_named packages
+#
+# The calendar entity itself comes from the Remote Calendar integration
+# (UI only), pointed at http://<your-ha>:8123/local/denhaag_festivals.ics.
+# If you name it "Den Haag festivals" the entity is calendar.den_haag_festivals.
+
+shell_command:
+  denhaag_festivals_refresh: >-
+    python3 /config/denhaag/denhaag_festivals.py
+    --out /config/www/denhaag_festivals.ics
+  denhaag_festivals_debug: >-
+    python3 /config/denhaag/denhaag_festivals.py
+    --out /config/www/denhaag_festivals.ics
+    --dump /config/www/denhaag_debug.html
+
+script:
+  denhaag_festivals_refresh:
+    alias: "Den Haag festivals: refresh"
+    icon: mdi:calendar-refresh
+    sequence:
+      - action: shell_command.denhaag_festivals_refresh
+        response_variable: result
+      - if: "{{ result.returncode != 0 }}"
+        then:
+          - action: persistent_notification.create
+            data:
+              notification_id: denhaag_festivals_error
+              title: Den Haag festivals refresh failed
+              message: >-
+                {{ result.stderr or result.stdout or 'No output' }}
+
+                Run the script "Den Haag festivals: debug dump" and look at
+                /config/www/denhaag_debug.html to see what the page returned.
+        else:
+          - action: persistent_notification.dismiss
+            data:
+              notification_id: denhaag_festivals_error
+          # Make Remote Calendar pick up the new file now instead of on its own schedule.
+          - action: homeassistant.update_entity
+            target:
+              entity_id: calendar.den_haag_festivals
+            continue_on_error: true
+
+  denhaag_festivals_debug:
+    alias: "Den Haag festivals: debug dump"
+    icon: mdi:bug
+    sequence:
+      - action: shell_command.denhaag_festivals_debug
+        response_variable: result
+      - action: persistent_notification.create
+        data:
+          title: Den Haag festivals debug
+          message: >-
+            Exit code {{ result.returncode }}
+
+            {{ result.stdout }}
+            {{ result.stderr }}
+
+            Page saved to /config/www/denhaag_debug.html
+
+  denhaag_weekend_digest:
+    alias: "Den Haag festivals: weekend digest"
+    icon: mdi:party-popper
+    fields:
+      notify_action:
+        description: Notify action to send the digest to
+        example: notify.mobile_app_jeffs_iphone
+        default: notify.notify
+        selector:
+          text:
+    sequence:
+      - variables:
+          target: "{{ notify_action | default('notify.notify', true) }}"
+          # Friday 17:00 through Sunday 23:59 of this week. Run on Saturday or
+          # Sunday it covers the rest of the weekend from now.
+          wd: "{{ now().weekday() }}"
+          window_start: >-
+            {% if wd | int >= 5 %}{{ now() }}
+            {% else %}{{ [(now() + timedelta(days=4 - wd | int)).replace(hour=17, minute=0, second=0, microsecond=0), now()] | max }}
+            {% endif %}
+          window_end: >-
+            {{ (now() + timedelta(days=6 - wd | int)).replace(hour=23, minute=59, second=0, microsecond=0) }}
+      - action: calendar.get_events
+        target:
+          entity_id: calendar.den_haag_festivals
+        data:
+          start_date_time: "{{ window_start }}"
+          end_date_time: "{{ window_end }}"
+        response_variable: cal
+      - variables:
+          events: "{{ cal['calendar.den_haag_festivals'].events | default([]) }}"
+          message: >-
+            {% if events | count == 0 %}
+            No festivals on the denhaag.com agenda this weekend.
+            {% else %}
+            {%- for e in events | sort(attribute='start') %}
+            {%- set all_day = 'T' not in e.start %}
+            {%- if all_day %}
+            {%- set s = e.start | as_datetime %}
+            {%- set last = (e.end | as_datetime) - timedelta(days=1) %}
+            {%- set when = s.strftime('%a %-d %b') if s.date() == last.date() else s.strftime('%a %-d %b') ~ ' to ' ~ last.strftime('%a %-d %b') %}
+            {%- else %}
+            {%- set when = (e.start | as_datetime | as_local).strftime('%a %-d %b %H:%M') %}
+            {%- endif %}
+            - {{ e.summary }} ({{ when }}){% if e.location %}, {{ e.location }}{% endif %}
+            {% endfor %}
+            {%- endif %}
+      - action: "{{ target }}"
+        data:
+          title: "This weekend in Den Haag ({{ events | count }})"
+          message: "{{ message | trim }}"
+
+automation:
+  - id: denhaag_festivals_refresh
+    alias: "Den Haag festivals: refresh daily"
+    mode: single
+    triggers:
+      - trigger: time
+        at: "06:10:00"
+      - trigger: homeassistant
+        event: start
+    actions:
+      - delay: "00:01:00"
+      - action: script.denhaag_festivals_refresh
+
+  - id: denhaag_weekend_digest
+    alias: "Den Haag festivals: Friday digest"
+    mode: single
+    triggers:
+      - trigger: time
+        at: "16:00:00"
+    conditions:
+      - condition: time
+        weekday: fri
+    actions:
+      # Refresh first so the digest uses today's data.
+      - action: script.denhaag_festivals_refresh
+      - delay: "00:00:30"
+      - action: script.denhaag_weekend_digest
+        data:
+          # Change this to your phone, e.g. notify.mobile_app_jeffs_iphone
+          notify_action: notify.notify
