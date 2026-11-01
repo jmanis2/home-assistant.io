@@ -1,203 +1,180 @@
 #!/usr/bin/env python3
-"""Scrape the denhaag.com festival agenda into an ICS file for Home Assistant.
+"""Turn the City of The Hague's event-permit open data into an ICS file for Home Assistant.
 
 Standard library only, so it runs inside the Home Assistant container
 (HA OS, Container or Core) without installing anything.
 
 Usage:
-    python3 denhaag_festivals.py [--out PATH] [--dump PATH] [URL ...]
+    python3 denhaag_festivals.py [--out PATH] [--dump PATH] [--file PATH]
 
-It looks for event data in two places, in order:
-  1. schema.org JSON-LD (<script type="application/ld+json">)
-  2. embedded JSON app state (__NEXT_DATA__, __NUXT_DATA__ or any
-     <script type="application/json">), scanning for objects that look
-     like events (a title plus a start date)
+Source: dataset "Evenementen Den Haag" (event permits from Key2Vergunningen) on
+https://den-haag-opendata.opendatasoft.com, also listed on data.overheid.nl.
+Each record is a permit: a free-text description such as "7Fest op 22 juli
+2028", a location, a start date and an end date. There is no category field,
+so withdrawn permits, private parties, small street parties and standing
+multi-year permits (weekly markets, yearly memorials) are dropped by keyword
+and by length. See EXCLUDE_RE and MAX_SPAN_DAYS.
 
-If nothing is found the existing ICS is left untouched and the script exits
-with status 1, so a site change never wipes your calendar. Use --dump to save
-the fetched HTML for debugging.
+If nothing is left the existing ICS is left untouched and the script exits
+with status 1, so a source problem never wipes your calendar. Use --dump to
+save the raw API JSON for debugging.
 """
 import argparse
 import datetime as dt
 import hashlib
-import html
 import json
 import os
 import re
 import sys
 import tempfile
+import urllib.parse
 import urllib.request
 from zoneinfo import ZoneInfo
 
-DEFAULT_URLS = ["https://denhaag.com/nl/agenda/festivals"]
+API = ("https://den-haag-opendata.opendatasoft.com/api/explore/v2.1"
+       "/catalog/datasets/evenementendenhaag/records")
+DATASET_URL = "https://den-haag-opendata.opendatasoft.com/explore/dataset/evenementendenhaag/"
 DEFAULT_OUT = "/config/www/denhaag_festivals.ics"
 TZ = ZoneInfo("Europe/Amsterdam")
-UA = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-      "(KHTML, like Gecko) Chrome/126.0 Safari/537.36")
+PAGE = 100  # API maximum per request
 
-EVENT_TYPES = {"Event", "Festival", "MusicEvent", "TheaterEvent", "FoodEvent",
-               "SocialEvent", "ExhibitionEvent", "SportsEvent", "DanceEvent",
-               "ComedyEvent", "ChildrensEvent", "LiteraryEvent", "ScreeningEvent",
-               "EducationEvent", "BusinessEvent", "VisualArtsEvent"}
-TITLE_KEYS = ("name", "title", "heading", "label")
-START_KEYS = ("startDate", "start_date", "start", "dateFrom", "date_from",
-              "from", "startsAt", "starts_at", "beginDate", "begin")
-END_KEYS = ("endDate", "end_date", "end", "dateTo", "date_to", "to",
-            "endsAt", "ends_at", "untilDate", "until")
-URL_KEYS = ("url", "href", "link", "slug", "path", "uri")
-LOC_KEYS = ("location", "venue", "place", "locationName", "address")
-DESC_KEYS = ("description", "summary", "intro", "teaser", "excerpt")
+# Permits longer than this are standing permits (weekly markets, yearly
+# memorials registered for 5 to 13 years at a time), not events. The longest
+# real events (fairs, a winter ice rink) run up to about 4 months.
+MAX_SPAN_DAYS = 180
 
-DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}([T ]\d{2}:\d{2}(:\d{2}(\.\d+)?)?)?(Z|[+-]\d{2}:?\d{2})?$")
+# Dropped by keyword in the permit description (case-insensitive):
+#   withdrawn permits; private parties and school sports days; small
+#   neighbourhood street parties; standing permits; placeholder reservations.
+EXCLUDE_RE = re.compile(
+    r"ingetrokken|nw aanvraag|nieuwe aanvraag"
+    r"|verjaardag|geslaagd|bruiloft|huwelijk|besloten|priv[eé]|school\s*sportdag"
+    r"|straatfeest|buurtfeest|burendag|straatspeeldag|buitenspeeldag"
+    r"|jaarlijks?\s*te?r?e?u?gkerend|iedere\s+(maan|dins|woens|donder|vrij|zater|zon)dag"
+    r"|reserveren voor",
+    re.I)
+
+MONTHS = ("januari|februari|maart|april|mei|juni|juli|augustus|september"
+          "|oktober|november|december")
+# Trailing date text, e.g. " op 22 juli 2028", " van 4 tot en met 6 september
+# 2026", " 15 en 16 mei 2027", " op 1 en 2 november".
+DATE_SUFFIX_RE = re.compile(
+    r"\s+(?:op|van|vanaf|d\.d\.)?\s*\d{1,2}(?:\s+(?:%s))?"
+    r"(?:\s*(?:,|en|t/m|tot en met|-|tot)\s*\d{1,2})*\s+(?:%s)\b.*$" % (MONTHS, MONTHS),
+    re.I)
+PREFIX_RE = re.compile(r"^\s*(?:verleend|muziekvergunning|herdenking)\s*", re.I)
+COMPANY_RE = re.compile(r"\s+(?:b\.?v\.?|stichting)$", re.I)
 
 
-def fetch(url):
+def fetch_json(params):
+    url = API + "?" + urllib.parse.urlencode(params)
     req = urllib.request.Request(url, headers={
-        "User-Agent": UA,
-        "Accept": "text/html,application/xhtml+xml",
-        "Accept-Language": "nl-NL,nl;q=0.9,en;q=0.8",
+        "User-Agent": "home-assistant-denhaag-festivals/2.0",
+        "Accept": "application/json",
     })
     with urllib.request.urlopen(req, timeout=30) as resp:
-        charset = resp.headers.get_content_charset() or "utf-8"
-        return resp.read().decode(charset, errors="replace")
+        return json.load(resp)
 
 
-def scripts(page, type_re):
-    pat = re.compile(r"<script\b([^>]*)>(.*?)</script>", re.S | re.I)
-    for attrs, body in pat.findall(page):
-        if re.search(type_re, attrs, re.I):
-            yield attrs, body
+def fetch_records(today):
+    """All permits that start no more than MAX_SPAN_DAYS before today.
+
+    einddatum is a text field, which ODSQL can't compare, so the server-side
+    filter is on ingangsdatum and the end date is checked in parse_record.
+    """
+    since = today - dt.timedelta(days=MAX_SPAN_DAYS)
+    records, offset = [], 0
+    while True:
+        data = fetch_json({
+            "where": f"ingangsdatum >= date'{since.isoformat()}'",
+            "order_by": "ingangsdatum, dossiernr",
+            "limit": PAGE,
+            "offset": offset,
+        })
+        batch = data.get("results", [])
+        records += batch
+        offset += len(batch)
+        if not batch or offset >= data.get("total_count", 0):
+            return records
 
 
-def load_json(text):
-    text = text.strip()
-    if text.startswith("<!--"):
-        text = text[4:]
-    if text.endswith("-->"):
-        text = text[:-3]
+def squash(s):
+    return re.sub(r"\s+", " ", s or "").strip()
+
+
+def parse_day(value):
+    """'2028-07-22T00:00:00+00:00' or '2028/07/22 00:00:00' -> date.
+
+    The dataset stores plain local dates at midnight, so only the date part
+    is meaningful.
+    """
+    if not isinstance(value, str):
+        return None
+    m = re.match(r"(\d{4})[-/](\d{2})[-/](\d{2})", value.strip())
+    if not m:
+        return None
     try:
-        return json.loads(text)
+        return dt.date(*map(int, m.groups()))
     except ValueError:
         return None
 
 
-def parse_date(value):
-    """Return (datetime_or_date, is_all_day) or None."""
-    if isinstance(value, (int, float)) and value > 10**9:
-        secs = value / 1000 if value > 10**11 else value
-        return dt.datetime.fromtimestamp(secs, tz=dt.timezone.utc), False
-    if not isinstance(value, str):
-        return None
-    s = value.strip()
-    if not DATE_RE.match(s):
-        return None
-    if len(s) == 10:
-        return dt.date.fromisoformat(s), True
-    s = s.replace(" ", "T").replace("Z", "+00:00")
-    s = re.sub(r"([+-]\d{2})(\d{2})$", r"\1:\2", s)
-    d = dt.datetime.fromisoformat(s)
-    if d.tzinfo is None:
-        d = d.replace(tzinfo=TZ)
-    return d, False
+def clean_title(desc):
+    t = PREFIX_RE.sub("", squash(desc))
+    t = DATE_SUFFIX_RE.sub("", t)
+    t = COMPANY_RE.sub("", t).strip(" -,.")
+    return t or squash(desc)
 
 
-def first(obj, keys):
-    for k in keys:
-        if k in obj and obj[k] not in (None, "", [], {}):
-            return obj[k]
-    return None
+def location_of(rec):
+    loc = squash(rec.get("lokatie"))
+    street = squash(rec.get("straat"))
+    if street and street.lower() not in loc.lower():
+        nr = squash(rec.get("huisnr"))
+        if nr and nr != "0":  # 0 means no house number
+            street = f"{street} {nr}"
+        loc = f"{loc}, {street}" if loc else street
+    return f"{loc}, Den Haag" if loc else "Den Haag"
 
 
-def text_of(value):
-    if isinstance(value, str):
-        return re.sub(r"<[^>]+>", "", html.unescape(value)).strip()
-    if isinstance(value, dict):
-        for k in ("name", "title", "text", "value", "nl", "en"):
-            if k in value:
-                return text_of(value[k])
-        addr = value.get("address")
-        if addr:
-            return text_of(addr)
-    if isinstance(value, list) and value:
-        return text_of(value[0])
-    return ""
+def parse_record(rec, today):
+    """Return (event, None) or (None, reason it was skipped)."""
+    desc = squash(rec.get("registr_oms"))
+    start = parse_day(rec.get("ingangsdatum"))
+    if not desc or not start:
+        return None, "no description or start date"
+    end = parse_day(rec.get("einddatum")) or start
+    if end < start:
+        end = start
+    if end < today:
+        return None, "already ended"
+    if (end - start).days > MAX_SPAN_DAYS:
+        return None, f"standing permit longer than {MAX_SPAN_DAYS} days"
+    m = EXCLUDE_RE.search(desc)
+    if m:
+        return None, f"keyword '{m.group(0).lower()}'"
 
+    details = [desc]
+    area = ", ".join(x for x in (squash(rec.get("wijk")).title(),
+                                 squash(rec.get("stadsdeel")).title()) if x)
+    if area:
+        details.append(f"Area: {area}")
+    if rec.get("bezoekersaantal"):
+        details.append(f"Expected visitors: {int(rec['bezoekersaantal'])}")
+    if rec.get("dossiernr"):
+        details.append(f"Permit {rec['dossiernr']}")
+    details.append("Source: Gemeente Den Haag open data (event permits)")
 
-def location_of(value):
-    if isinstance(value, dict):
-        parts = [text_of(value.get("name", ""))]
-        addr = value.get("address")
-        if isinstance(addr, dict):
-            parts.append(", ".join(x for x in (
-                addr.get("streetAddress"), addr.get("addressLocality")) if x))
-        elif isinstance(addr, str):
-            parts.append(addr)
-        return ", ".join(p for p in parts if p)
-    return text_of(value)
-
-
-def absolute(url, base):
-    if not isinstance(url, str) or not url:
-        return base
-    if url.startswith("http"):
-        return url
-    if url.startswith("/"):
-        return "https://denhaag.com" + url
-    return base
-
-
-def to_event(obj, base_url, strict):
-    if not isinstance(obj, dict):
-        return None
-    if strict:
-        t = obj.get("@type")
-        types = set(t) if isinstance(t, list) else {t}
-        if not types & EVENT_TYPES:
-            return None
-    title = text_of(first(obj, TITLE_KEYS))
-    start = parse_date(first(obj, START_KEYS))
-    if not title or not start:
-        return None
-    end = parse_date(first(obj, END_KEYS))
+    geo = rec.get("geo_point_2d") or {}
     return {
-        "title": title,
-        "start": start,
-        "end": end,
-        "url": absolute(first(obj, URL_KEYS), base_url),
-        "location": location_of(first(obj, LOC_KEYS)),
-        "description": text_of(first(obj, DESC_KEYS))[:500],
-    }
-
-
-def walk(node, base_url, strict, out):
-    if isinstance(node, list):
-        for n in node:
-            walk(n, base_url, strict, out)
-    elif isinstance(node, dict):
-        ev = to_event(node, base_url, strict)
-        if ev:
-            out.append(ev)
-            # JSON-LD events can carry subEvent lists; app state usually not.
-            if strict and "subEvent" in node:
-                walk(node["subEvent"], base_url, strict, out)
-            return
-        for v in node.values():
-            walk(v, base_url, strict, out)
-
-
-def extract(page, base_url):
-    events = []
-    for _, body in scripts(page, r"application/ld\+json"):
-        data = load_json(body)
-        if data is not None:
-            walk(data, base_url, True, events)
-    if events:
-        return events, "json-ld"
-    for _, body in scripts(page, r"application/json|__NEXT_DATA__|__NUXT"):
-        data = load_json(body)
-        if data is not None:
-            walk(data, base_url, False, events)
-    return events, "app-state" if events else "none"
+        "title": clean_title(desc),
+        "start": (start, True),
+        "end": (end, True),
+        "url": DATASET_URL,
+        "location": location_of(rec),
+        "description": "\n".join(details)[:500],
+        "geo": (geo.get("lat"), geo.get("lon")) if geo.get("lat") is not None else None,
+    }, None
 
 
 # ---------- ICS output ----------
@@ -262,9 +239,10 @@ def build_ics(events):
         ]
         if ev["location"]:
             lines.append(f"LOCATION:{esc(ev['location'])}")
-        desc = "\n\n".join(x for x in (ev["description"], ev["url"]) if x)
-        if desc:
-            lines.append(f"DESCRIPTION:{esc(desc)}")
+        if ev.get("geo"):
+            lines.append(f"GEO:{ev['geo'][0]:.6f};{ev['geo'][1]:.6f}")
+        if ev["description"]:
+            lines.append(f"DESCRIPTION:{esc(ev['description'])}")
         if ev["url"]:
             lines.append(f"URL:{ev['url']}")
         lines.append("END:VEVENT")
@@ -284,43 +262,52 @@ def write_atomic(path, content):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    ap.add_argument("urls", nargs="*", default=DEFAULT_URLS)
     ap.add_argument("--out", default=DEFAULT_OUT)
-    ap.add_argument("--dump", help="save fetched HTML here for debugging")
-    ap.add_argument("--file", help="parse a saved HTML file instead of fetching")
+    ap.add_argument("--dump", help="save the raw API records (JSON) here for debugging")
+    ap.add_argument("--file", help="parse saved records (JSON list) instead of fetching")
+    ap.add_argument("-v", "--verbose", action="store_true", help="list skipped permits")
     args = ap.parse_args()
 
-    found, seen = [], set()
-    sources = [(args.file, None)] if args.file else [(None, u) for u in args.urls]
-    for path, url in sources:
-        try:
-            if path:
-                with open(path, encoding="utf-8") as f:
-                    page = f.read()
-                url = DEFAULT_URLS[0]
-            else:
-                page = fetch(url)
-        except Exception as e:
-            print(f"ERROR fetching {url or path}: {e}", file=sys.stderr)
+    today = dt.datetime.now(TZ).date()
+    try:
+        if args.file:
+            with open(args.file, encoding="utf-8") as f:
+                records = json.load(f)
+        else:
+            records = fetch_records(today)
+    except Exception as e:
+        print(f"ERROR fetching {args.file or API}: {e}", file=sys.stderr)
+        records = None
+    if records is not None and args.dump:
+        with open(args.dump, "w", encoding="utf-8") as f:
+            json.dump(records, f, ensure_ascii=False, indent=1)
+
+    found, seen, skipped = [], set(), {}
+    for rec in records or []:
+        ev, reason = parse_record(rec, today)
+        if not ev:
+            skipped[reason] = skipped.get(reason, 0) + 1
+            if args.verbose:
+                print(f"skip ({reason}): {squash(rec.get('registr_oms'))}")
             continue
-        if args.dump:
-            with open(args.dump, "w", encoding="utf-8") as f:
-                f.write(page)
-        events, how = extract(page, url)
-        print(f"{url}: {len(events)} events via {how}")
-        for ev in events:
-            key = (ev["title"].lower(), str(ev["start"][0]))
-            if key not in seen:
-                seen.add(key)
-                found.append(ev)
+        key = (ev["title"].lower(), ev["start"][0])
+        if key in seen:
+            skipped["duplicate"] = skipped.get("duplicate", 0) + 1
+            continue
+        seen.add(key)
+        found.append(ev)
+
+    if records is not None:
+        print(f"{len(records)} permits fetched, {len(found)} events kept"
+              + "".join(f"; {n} skipped: {r}" for r, n in sorted(skipped.items())))
 
     if not found:
         print("No events found; leaving existing calendar untouched. "
-              "Run with --dump /config/www/denhaag_debug.html to inspect the page.",
+              "Run with --dump /config/www/denhaag_debug.json to inspect the data.",
               file=sys.stderr)
         return 1
 
-    found.sort(key=lambda e: (str(e["start"][0]), e["title"]))
+    found.sort(key=lambda e: (e["start"][0], e["title"]))
     write_atomic(args.out, build_ics(found))
     print(f"Wrote {len(found)} events to {args.out}")
     return 0

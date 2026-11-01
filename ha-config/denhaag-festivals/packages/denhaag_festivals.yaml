@@ -1,4 +1,5 @@
-# Den Haag festivals: scrape denhaag.com into a calendar and send a weekend digest.
+# Den Haag festivals: turn the city's event-permit open data (Gemeente Den Haag,
+# dataset evenementendenhaag) into a calendar and send a weekend digest.
 #
 # Needs, in configuration.yaml:
 #   homeassistant:
@@ -15,7 +16,7 @@ shell_command:
   denhaag_festivals_debug: >-
     python3 /config/denhaag/denhaag_festivals.py
     --out /config/www/denhaag_festivals.ics
-    --dump /config/www/denhaag_debug.html
+    --dump /config/www/denhaag_debug.json
 
 script:
   denhaag_festivals_refresh:
@@ -34,7 +35,7 @@ script:
                 {{ result.stderr or result.stdout or 'No output' }}
 
                 Run the script "Den Haag festivals: debug dump" and look at
-                /config/www/denhaag_debug.html to see what the page returned.
+                /config/www/denhaag_debug.json to see what the open data API returned.
         else:
           - action: persistent_notification.dismiss
             data:
@@ -60,7 +61,7 @@ script:
             {{ result.stdout }}
             {{ result.stderr }}
 
-            Page saved to /config/www/denhaag_debug.html
+            Raw API records saved to /config/www/denhaag_debug.json
 
   denhaag_weekend_digest:
     alias: "Den Haag festivals: weekend digest"
@@ -95,7 +96,7 @@ script:
           events: "{{ cal['calendar.den_haag_festivals'].events | default([]) }}"
           message: >-
             {% if events | count == 0 %}
-            No festivals on the denhaag.com agenda this weekend.
+            No events in the Den Haag event permits this weekend.
             {% else %}
             {%- for e in events | sort(attribute='start') %}
             {%- set all_day = 'T' not in e.start %}
@@ -142,5 +143,4 @@ automation:
       - delay: "00:00:30"
       - action: script.denhaag_weekend_digest
         data:
-          # Change this to your phone, e.g. notify.mobile_app_jeffs_iphone
-          notify_action: notify.notify
+          notify_action: notify.mobile_app_jeffs_iphone
